@@ -3,59 +3,72 @@ from sentence_transformers import SentenceTransformer, util
 from pypdf import PdfReader
 import torch
 import io
+import uvicorn
+import re
 
 app = FastAPI()
 
-# Carrega apenas o modelo de similaridade (Embeddings)
+# Carrega o modelo de similaridade
 model_embeddings = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
-def extrair_e_validar_peticao(texto_completo, nome_arquivo):
+def extrair_merito_peticao(texto_completo, nome_arquivo):
     """
-    Aplica regras heurísticas para garantir que o documento é uma petição
-    e extrai apenas as seções relevantes (Fatos e Pedidos).
+    Valida se é uma petição e extrai ESTRITAMENTE a seção de fatos (o mérito),
+    eliminando o ruído dos pedidos e jargões processuais genéricos.
     """
     texto_maiusculo = texto_completo.upper()
-
-    # 1. Checagem de Cabeçalho (Opcional, mas muito forte)
-    # Procura termos jurídicos essenciais nas primeiras 2000 letras do documento
-    termos_chave_peticao = ["EXCELENTÍSSIMO", "JUIZ DE DIREITO", "VARA", "COMARCA", "AÇÃO", "JUIZADO ESPECIAL"]
-    cabecalho = texto_maiusculo[:2000] 
+    pontuacao = 0
     
-    tem_caracteristica_juridica = any(termo in cabecalho for termo in termos_chave_peticao)
+    # 1. Validação por Score (Porteiro Heurístico)
+    evidencias = {
+        r'\bEXCELENTÍSSIMO\b': 2,
+        r'\bDOUTO JUÍZO\b': 2,
+        r'\bVARA\b': 1,
+        r'\bCOMARCA\b': 1,
+        r'\bJUIZADO ESPECIAL\b': 1,
+        r'\bAÇÃO ORDINÁRIA\b': 2,
+        r'\bAÇÃO DE\b': 1,
+        r'\bFAZENDA PÚBLICA\b': 1,
+        r'\bQUALIFICADO\b': 1,
+        r'\bPEDE DEFERIMENTO\b': 2
+    }
 
-    # 2. Busca pelas seções principais
+    for padrao, pontos in evidencias.items():
+        if re.search(padrao, texto_maiusculo):
+            pontuacao += pontos
+
     inicio_fatos = texto_maiusculo.find("DOS FATOS")
     inicio_pedidos = texto_maiusculo.find("DOS PEDIDOS")
+    
+    if inicio_fatos != -1: pontuacao += 3
+    if inicio_pedidos != -1: pontuacao += 3
 
-    # REGRA DE CORTE (O Porteiro Heurístico)
-    # Se não tem o vocabulário de cabeçalho e não tem as seções, rejeita imediatamente.
-    if not tem_caracteristica_juridica and inicio_fatos == -1 and inicio_pedidos == -1:
-        raise ValueError(f"O arquivo '{nome_arquivo}' não possui a estrutura ou os termos de uma petição legal válida.")
+    if pontuacao < 4:
+        raise ValueError(f"O arquivo '{nome_arquivo}' não possui elementos suficientes de uma petição legal válida (Score: {pontuacao}).")
 
-    # 3. Extração (Se passou pelo porteiro)
-    secoes = []
+    # 2. Extração Focada no Assunto (MÉRITO)
+    # Ignoramos os pedidos, pois eles contêm muitos termos genéricos (citação, honorários, etc)
     if inicio_fatos != -1:
-        proxima_secao_apos_fatos = texto_maiusculo.find("DO DIREITO", inicio_fatos)
-        if proxima_secao_apos_fatos == -1:
-            proxima_secao_apos_fatos = inicio_pedidos if inicio_pedidos > inicio_fatos else len(texto_maiusculo)
+        # O fim dos fatos geralmente é onde começa 'DO DIREITO' ou 'DOS PEDIDOS'
+        fim_fatos = texto_maiusculo.find("DO DIREITO", inicio_fatos)
+        if fim_fatos == -1:
+            fim_fatos = inicio_pedidos if inicio_pedidos > inicio_fatos else len(texto_maiusculo)
         
-        secoes.append(texto_completo[inicio_fatos:proxima_secao_apos_fatos])
+        texto_fatos = texto_completo[inicio_fatos:fim_fatos].strip()
+        
+        # Se os fatos forem muito curtos (menos de 100 caracteres), pegamos um pouco mais de contexto
+        if len(texto_fatos) > 100:
+            return texto_fatos
 
-    if inicio_pedidos != -1:
-        secoes.append(texto_completo[inicio_pedidos:])
-        
-    # Se a petição for atípica/curta e só tiver passado pelo cabeçalho, devolve ela toda
-    return "\n".join(secoes) if secoes else texto_completo
+    # Caso não ache 'DOS FATOS' explicitamente ou seja muito curto, pegamos o início 
+    # (onde costuma haver a qualificação e o nome da ação) até um limite seguro.
+    return texto_completo[:4000].strip()
 
 def dividir_em_blocos(texto, limite_palavras=300):
     palavras = texto.split()
     if not palavras:
         return [""]
-        
-    blocos = []
-    for i in range(0, len(palavras), limite_palavras):
-        bloco = " ".join(palavras[i:i+limite_palavras])
-        blocos.append(bloco)
+    blocos = [" ".join(palavras[i:i+limite_palavras]) for i in range(0, len(palavras), limite_palavras)]
     return blocos
 
 def gerar_embedding_documento(texto_relevante):
@@ -64,7 +77,7 @@ def gerar_embedding_documento(texto_relevante):
     embedding_final = torch.mean(embeddings_blocos, dim=0, keepdim=True)
     return embedding_final
 
-def ler_pdf_e_validar(arquivo_pdf: UploadFile, nome_arquivo: str):
+def ler_pdf_e_extrair_merito(arquivo_pdf: UploadFile):
     conteudo = arquivo_pdf.file.read()
     leitor_pdf = PdfReader(io.BytesIO(conteudo))
     
@@ -72,43 +85,38 @@ def ler_pdf_e_validar(arquivo_pdf: UploadFile, nome_arquivo: str):
     for page in leitor_pdf.pages:
         texto_completo += page.extract_text() or ""
     
-    # Extrai e valida ao mesmo tempo usando regras leves (Regex/Find)
-    texto_relevante = extrair_e_validar_peticao(texto_completo, nome_arquivo)
-    
-    return texto_relevante.strip()
+    # Extrai especificamente a parte que define o ASSUNTO
+    return extrair_merito_peticao(texto_completo, arquivo_pdf.filename)
 
 @app.post("/comparar-peticoes/")
 async def comparar_peticoes_api(peticao1: UploadFile = File(...), peticao2: UploadFile = File(...)):
     try:
-        texto1 = ler_pdf_e_validar(peticao1, "Petição 1")
-        texto2 = ler_pdf_e_validar(peticao2, "Petição 2")
+        # Extraímos apenas o MÉRITO (Fatos) de cada uma
+        merito1 = ler_pdf_e_extrair_merito(peticao1)
+        merito2 = ler_pdf_e_extrair_merito(peticao2)
 
-        if not texto1 or not texto2:
-            return {"erro": "Um ou ambos os PDFs não possuem texto legível."}
+        if not merito1 or not merito2:
+            return {"erro": "Conteúdo insuficiente para análise em um dos documentos."}
 
-        emb1 = gerar_embedding_documento(texto1)
-        emb2 = gerar_embedding_documento(texto2)
+        # Gera embeddings baseados apenas no assunto real
+        emb1 = gerar_embedding_documento(merito1)
+        emb2 = gerar_embedding_documento(merito2)
 
         similaridade = util.cos_sim(emb1, emb2)
         percentual = similaridade.item() * 100
 
-        if percentual >= 65.0:
-            classificacao = "Mesmo assunto"
-        else:
-            classificacao = "Sem relação"
+        # Com o ruído removido, 65% torna-se um limite muito mais confiável
+        classificacao = "Mesmo assunto" if percentual >= 65.0 else "Sem relação"
 
-        resultado = {
+        return {
             "classificacao": classificacao,
-            "similaridade_percentual": f"{percentual:.2f}%",
+            "similaridade_percentual": f"{percentual:.2f}%"
         }
-            
-        return resultado
 
     except ValueError as ve:
-        # Retorna o erro de validação heurística para o frontend exibir
-        return {
-            "erro_validacao": str(ve),
-            "status": "documento_invalido"
-        }
+        return {"erro_validacao": str(ve), "status": "documento_invalido"}
     except Exception as e:
         return {"erro_interno": str(e)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
