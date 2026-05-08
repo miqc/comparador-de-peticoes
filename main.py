@@ -1,36 +1,44 @@
 from fastapi import FastAPI, File, UploadFile
 from sentence_transformers import SentenceTransformer, util
 from pypdf import PdfReader
+import uvicorn
 import torch
 import io
-import uvicorn
+import sqlite3
+import json
 import re
 
 app = FastAPI()
+model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
-# Carrega o modelo de similaridade
-model_embeddings = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+DB_PATH = "peticoes_juridicas.db"
 
-def extrair_merito_peticao(texto_completo, nome_arquivo):
-    """
-    Valida se é uma petição e extrai ESTRITAMENTE a seção de fatos (o mérito),
-    eliminando o ruído dos pedidos e jargões processuais genéricos.
-    """
+# --- CONFIGURAÇÃO INICIAL DO BANCO ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS peticoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_arquivo TEXT,
+            merito TEXT,
+            vetor TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- AUXILIARES DE PLN (MÉRITO E VALIDAÇÃO) ---
+def extrair_e_validar_merito(texto_completo, nome_arquivo):
     texto_maiusculo = texto_completo.upper()
     pontuacao = 0
     
-    # 1. Validação por Score (Porteiro Heurístico)
+    # Evidências Jurídicas [cite: 567, 780]
     evidencias = {
-        r'\bEXCELENTÍSSIMO\b': 2,
-        r'\bDOUTO JUÍZO\b': 2,
-        r'\bVARA\b': 1,
-        r'\bCOMARCA\b': 1,
-        r'\bJUIZADO ESPECIAL\b': 1,
-        r'\bAÇÃO ORDINÁRIA\b': 2,
-        r'\bAÇÃO DE\b': 1,
-        r'\bFAZENDA PÚBLICA\b': 1,
-        r'\bQUALIFICADO\b': 1,
-        r'\bPEDE DEFERIMENTO\b': 2
+        r'\bEXCELENTÍSSIMO\b': 2, r'\bDOUTO JUÍZO\b': 2, r'\bVARA\b': 1,
+        r'\bCOMARCA\b': 1, r'\bAÇÃO ORDINÁRIA\b': 2, r'\bPEDE DEFERIMENTO\b': 2
     }
 
     for padrao, pontos in evidencias.items():
@@ -38,85 +46,150 @@ def extrair_merito_peticao(texto_completo, nome_arquivo):
             pontuacao += pontos
 
     inicio_fatos = texto_maiusculo.find("DOS FATOS")
-    inicio_pedidos = texto_maiusculo.find("DOS PEDIDOS")
-    
     if inicio_fatos != -1: pontuacao += 3
-    if inicio_pedidos != -1: pontuacao += 3
 
     if pontuacao < 4:
-        raise ValueError(f"O arquivo '{nome_arquivo}' não possui elementos suficientes de uma petição legal válida (Score: {pontuacao}).")
+        raise ValueError(f"Arquivo '{nome_arquivo}' reprovado no score jurídico.")
 
-    # 2. Extração Focada no Assunto (MÉRITO)
-    # Ignoramos os pedidos, pois eles contêm muitos termos genéricos (citação, honorários, etc)
+    # Foco no Mérito para evitar similaridade artificial [cite: 693, 822]
     if inicio_fatos != -1:
-        # O fim dos fatos geralmente é onde começa 'DO DIREITO' ou 'DOS PEDIDOS'
         fim_fatos = texto_maiusculo.find("DO DIREITO", inicio_fatos)
         if fim_fatos == -1:
-            fim_fatos = inicio_pedidos if inicio_pedidos > inicio_fatos else len(texto_maiusculo)
-        
-        texto_fatos = texto_completo[inicio_fatos:fim_fatos].strip()
-        
-        # Se os fatos forem muito curtos (menos de 100 caracteres), pegamos um pouco mais de contexto
-        if len(texto_fatos) > 100:
-            return texto_fatos
-
-    # Caso não ache 'DOS FATOS' explicitamente ou seja muito curto, pegamos o início 
-    # (onde costuma haver a qualificação e o nome da ação) até um limite seguro.
+            fim_fatos = texto_maiusculo.find("DOS PEDIDOS", inicio_fatos)
+        return texto_completo[inicio_fatos:fim_fatos].strip()
+    
     return texto_completo[:4000].strip()
 
-def dividir_em_blocos(texto, limite_palavras=300):
-    palavras = texto.split()
-    if not palavras:
-        return [""]
-    blocos = [" ".join(palavras[i:i+limite_palavras]) for i in range(0, len(palavras), limite_palavras)]
-    return blocos
+# --- ENDPOINTS ---
 
-def gerar_embedding_documento(texto_relevante):
-    blocos = dividir_em_blocos(texto_relevante)
-    embeddings_blocos = model_embeddings.encode(blocos, convert_to_tensor=True)
-    embedding_final = torch.mean(embeddings_blocos, dim=0, keepdim=True)
-    return embedding_final
-
-def ler_pdf_e_extrair_merito(arquivo_pdf: UploadFile):
-    conteudo = arquivo_pdf.file.read()
-    leitor_pdf = PdfReader(io.BytesIO(conteudo))
-    
-    texto_completo = ""
-    for page in leitor_pdf.pages:
-        texto_completo += page.extract_text() or ""
-    
-    # Extrai especificamente a parte que define o ASSUNTO
-    return extrair_merito_peticao(texto_completo, arquivo_pdf.filename)
-
-@app.post("/comparar-peticoes/")
-async def comparar_peticoes_api(peticao1: UploadFile = File(...), peticao2: UploadFile = File(...)):
+@app.post("/armazenar-peticao/")
+async def armazenar_peticao(arquivo: UploadFile = File(...)):
+    """Lê o PDF, valida, gera o vetor e salva no SQLite."""
     try:
-        # Extraímos apenas o MÉRITO (Fatos) de cada uma
-        merito1 = ler_pdf_e_extrair_merito(peticao1)
-        merito2 = ler_pdf_e_extrair_merito(peticao2)
+        conteudo = await arquivo.read()
+        leitor = PdfReader(io.BytesIO(conteudo))
+        texto_completo = "".join([page.extract_text() or "" for page in leitor.pages])
+        
+        merito = extrair_e_validar_merito(texto_completo, arquivo.filename)
+        embedding = model.encode(merito, convert_to_tensor=True)
+        
+        # Converte o tensor para lista e depois para string JSON para salvar no SQLite
+        vetor_json = json.dumps(embedding.tolist())
 
-        if not merito1 or not merito2:
-            return {"erro": "Conteúdo insuficiente para análise em um dos documentos."}
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO peticoes (nome_arquivo, merito, vetor) VALUES (?, ?, ?)", 
+                       (arquivo.filename, merito, vetor_json))
+        conn.commit()
+        conn.close()
 
-        # Gera embeddings baseados apenas no assunto real
-        emb1 = gerar_embedding_documento(merito1)
-        emb2 = gerar_embedding_documento(merito2)
+        return {"status": "sucesso", "arquivo": arquivo.filename, "mensagem": "Petição indexada no banco."}
+    except Exception as e:
+        return {"erro": str(e)}
 
-        similaridade = util.cos_sim(emb1, emb2)
-        percentual = similaridade.item() * 100
+@app.post("/comparar-com-banco/")
+async def comparar_com_banco(arquivo_novo: UploadFile = File(...)):
+    """Compara a petição enviada contra TODAS as petições do banco de dados."""
+    try:
+        # 1. Processar a nova petição
+        conteudo = await arquivo_novo.read()
+        leitor = PdfReader(io.BytesIO(conteudo))
+        texto_novo = "".join([page.extract_text() or "" for page in leitor.pages])
+        merito_novo = extrair_e_validar_merito(texto_novo, arquivo_novo.filename)
+        emb_novo = model.encode(merito_novo, convert_to_tensor=True)
 
-        # Com o ruído removido, 65% torna-se um limite muito mais confiável
-        classificacao = "Mesmo assunto" if percentual >= 65.0 else "Sem relação"
+        # 2. Buscar todos os vetores do banco
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT nome_arquivo, vetor FROM peticoes")
+        registros = cursor.fetchall()
+        conn.close()
+
+        if not registros:
+            return {"aviso": "O banco de dados está vazio."}
+
+        # 3. Preparar a comparação em massa
+        nomes = [r[0] for r in registros]
+        # Converte strings JSON de volta para Tensores do PyTorch
+        vetores_base = torch.tensor([json.loads(r[1]) for r in registros])
+
+        # 4. Cálculo de Similaridade de Cosseno (Matriz vs Vetor)
+        # S_C = (A . B) / (||A|| ||B||)
+        similaridades = util.cos_sim(emb_novo, vetores_base)[0]
+        
+        # Pega o melhor resultado
+        maior_score, indice = torch.max(similaridades, dim=0)
+        percentual = maior_score.item() * 100
 
         return {
-            "classificacao": classificacao,
-            "similaridade_percentual": f"{percentual:.2f}%"
+            "classificacao": "Mesmo assunto" if percentual >= 65 else "Assunto diferente",
+            "similaridade": f"{percentual:.2f}%",
+            "melhor_match": nomes[indice.item()],
+            "analisados": len(nomes)
         }
 
-    except ValueError as ve:
-        return {"erro_validacao": str(ve), "status": "documento_invalido"}
     except Exception as e:
-        return {"erro_interno": str(e)}
+        return {"erro": str(e)}
+    
+# --- NOVOS ENDPOINTS (CRUD) ---
+
+@app.get("/peticoes/")
+async def listar_peticoes():
+    """Retorna uma lista de todas as petições indexadas no banco."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # Selecionamos apenas id e nome para não sobrecarregar a resposta com vetores longos
+        cursor.execute("SELECT id, nome_arquivo FROM peticoes")
+        registros = cursor.fetchall()
+        conn.close()
+
+        lista = [{"id": r[0], "nome_arquivo": r[1]} for r in registros]
+        return {"total": len(lista), "peticoes": lista}
+    except Exception as e:
+        return {"erro": str(e)}
+
+@app.get("/peticoes/{id}")
+async def obter_peticao(id: int):
+    """Busca os detalhes de uma petição específica pelo ID."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, nome_arquivo, merito FROM peticoes WHERE id = ?", (id,))
+        registro = cursor.fetchone()
+        conn.close()
+
+        if not registro:
+            return {"erro": "Petição não encontrada."}
+
+        return {
+            "id": registro[0],
+            "nome_arquivo": registro[1],
+            "merito_extraido": registro[2]
+        }
+    except Exception as e:
+        return {"erro": str(e)}
+
+@app.delete("/peticoes/{id}")
+async def deletar_peticao(id: int):
+    """Remove uma petição da base de dados pelo ID."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Verifica se existe antes de deletar
+        cursor.execute("SELECT id FROM peticoes WHERE id = ?", (id,))
+        if not cursor.fetchone():
+            conn.close()
+            return {"erro": "ID não encontrado no banco de dados."}
+
+        cursor.execute("DELETE FROM peticoes WHERE id = ?", (id,))
+        conn.commit()
+        conn.close()
+
+        return {"status": "sucesso", "mensagem": f"Petição ID {id} removida com sucesso."}
+    except Exception as e:
+        return {"erro": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8081)
