@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sentence_transformers import SentenceTransformer, util
 from pypdf import PdfReader
@@ -13,6 +14,15 @@ import shutil
 
 app = FastAPI()
 model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+# CORS para o frontend local
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuração de diretórios
 DB_PATH = "peticoes_juridicas.db"
@@ -152,6 +162,10 @@ async def recomendar(arquivo_novo: UploadFile = File(...)):
 #         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor.")
 
 #     return FileResponse(path=res[1], filename=res[0], media_type='application/pdf')
+
+@app.get("/")
+async def raiz():    
+    return {"mensagem": "API funcionando!"}
 
 @app.get("/peticoes/")
 async def listar():
