@@ -80,7 +80,7 @@ def extrair_e_validar_merito(texto_completo, nome_arquivo):
 
 # --- ENDPOINTS ---
 
-@app.post("/armazenar/")
+@app.post("/armazenar")
 async def armazenar(arquivo_peticao: UploadFile = File(...), arquivo_despacho: UploadFile = File(...)):
     """Salva os PDFs no disco e cria o vínculo semântico no banco."""
     try:
@@ -114,7 +114,7 @@ async def armazenar(arquivo_peticao: UploadFile = File(...), arquivo_despacho: U
     except Exception as e:
         return {"erro": str(e)}
 
-@app.post("/comparar/")
+@app.post("/comparar")
 async def recomendar(arquivo_novo: UploadFile = File(...)):
     """Busca a petição mais similar e retorna o nome/ID do despacho correspondente."""
     try:
@@ -149,20 +149,6 @@ async def recomendar(arquivo_novo: UploadFile = File(...)):
     except Exception as e:
         return {"erro": str(e)}
 
-# @app.get("/baixar-despacho/{id}")
-# async def baixar(id: int):
-#     """Permite o download do arquivo físico do despacho pelo ID."""
-#     conn = sqlite3.connect(DB_PATH)
-#     cursor = conn.cursor()
-#     cursor.execute("SELECT nome_despacho, caminho_despacho FROM peticoes WHERE id = ?", (id,))
-#     res = cursor.fetchone()
-#     conn.close()
-
-#     if not res or not os.path.exists(res[1]):
-#         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor.")
-
-#     return FileResponse(path=res[1], filename=res[0], media_type='application/pdf')
-
 @app.get("/")
 async def raiz():    
     return {"mensagem": "API funcionando!"}
@@ -176,7 +162,7 @@ async def listar():
     conn.close()
     return [{"id": r[0], "peticao": r[1], "despacho": r[2]} for r in registros]
 
-@app.delete("/peticoes/{id}")
+@app.delete("/peticoes{id}")
 async def deletar(id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
