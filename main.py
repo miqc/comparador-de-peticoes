@@ -36,10 +36,13 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS peticoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titulo_peticao TEXT,
             nome_peticao TEXT,
             merito TEXT,
             vetor TEXT,
+            titulo_despacho TEXT,
             nome_despacho TEXT,
+            caminho_peticao TEXT,
             caminho_despacho TEXT
         )
     ''')
@@ -81,8 +84,13 @@ def extrair_e_validar_merito(texto_completo, nome_arquivo):
 # --- ENDPOINTS ---
 
 @app.post("/armazenar")
-async def armazenar(arquivo_peticao: UploadFile = File(...), arquivo_despacho: UploadFile = File(...)):
-    """Salva os PDFs no disco e cria o vínculo semântico no banco."""
+async def armazenar(
+    titulo_peticao: str = None,
+    titulo_despacho: str = None,
+    arquivo_peticao: UploadFile = File(...),
+    arquivo_despacho: UploadFile = File(...)
+):
+    """Salva os PDFs no disco com títulos e cria o vínculo semântico no banco."""
     try:
         path_peticao = os.path.join(UPLOAD_DIR, "peticoes", arquivo_peticao.filename)
         path_despacho = os.path.join(UPLOAD_DIR, "despachos", arquivo_despacho.filename)
@@ -104,19 +112,29 @@ async def armazenar(arquivo_peticao: UploadFile = File(...), arquivo_despacho: U
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO peticoes (nome_peticao, merito, vetor, nome_despacho, caminho_despacho) 
-            VALUES (?, ?, ?, ?, ?)
-        ''', (arquivo_peticao.filename, merito, json.dumps(vetor.tolist()), arquivo_despacho.filename, path_despacho))
+            INSERT INTO peticoes (titulo_peticao, nome_peticao, merito, vetor, titulo_despacho, nome_despacho, caminho_peticao, caminho_despacho) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            titulo_peticao or arquivo_peticao.filename,
+            arquivo_peticao.filename,
+            merito,
+            json.dumps(vetor.tolist()),
+            titulo_despacho or arquivo_despacho.filename,
+            arquivo_despacho.filename,
+            path_peticao,
+            path_despacho
+        ))
         conn.commit()
+        inserted_id = cursor.lastrowid
         conn.close()
 
-        return {"status": "sucesso", "despacho_vinculado": arquivo_despacho.filename}
+        return {"status": "sucesso", "id": inserted_id, "despacho_vinculado": arquivo_despacho.filename}
     except Exception as e:
         return {"erro": str(e)}
 
 @app.post("/comparar")
 async def recomendar(arquivo_novo: UploadFile = File(...)):
-    """Busca a petição mais similar e retorna o nome/ID do despacho correspondente."""
+    """Busca a petição mais similar e retorna títulos e IDs dos documentos."""
     try:
         conteudo = await arquivo_novo.read()
         leitor = PdfReader(io.BytesIO(conteudo))
@@ -126,7 +144,7 @@ async def recomendar(arquivo_novo: UploadFile = File(...)):
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, nome_peticao, vetor, nome_despacho FROM peticoes")
+        cursor.execute("SELECT id, titulo_peticao, vetor, titulo_despacho FROM peticoes")
         registros = cursor.fetchall()
         conn.close()
 
@@ -142,38 +160,88 @@ async def recomendar(arquivo_novo: UploadFile = File(...)):
 
         return {
             "similaridade": f"{percentual:.2f}%",
-            "peticao_base": resultado[1],
-            "despacho_sugerido": resultado[3],
-            "download_id": resultado[0] if percentual >= 65 else None
+            "titulo_peticao": resultado[1],
+            "titulo_despacho": resultado[3],
+            "id": resultado[0],
+            "pode_acessar": percentual >= 65
         }
     except Exception as e:
         return {"erro": str(e)}
-
-@app.get("/")
-async def raiz():    
-    return {"mensagem": "API funcionando!"}
 
 @app.get("/peticoes/")
 async def listar():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, nome_peticao, nome_despacho FROM peticoes")
+    cursor.execute("SELECT id, titulo_peticao, titulo_despacho FROM peticoes")
     registros = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "peticao": r[1], "despacho": r[2]} for r in registros]
+    return [{"id": r[0], "titulo_peticao": r[1], "titulo_despacho": r[2]} for r in registros]
 
-@app.delete("/peticoes{id}")
+@app.get("/acessar/{doc_id}/{tipo}")
+async def acessar_documento(doc_id: int, tipo: str):
+    """Visualiza PDF no navegador ou faz download de outros formatos."""
+    try:
+        if tipo not in ["peticao", "despacho"]:
+            raise HTTPException(status_code=400, detail="Tipo deve ser 'peticao' ou 'despacho'")
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        if tipo == "peticao":
+            cursor.execute("SELECT nome_peticao, caminho_peticao FROM peticoes WHERE id = ?", (doc_id,))
+        else:
+            cursor.execute("SELECT nome_despacho, caminho_despacho FROM peticoes WHERE id = ?", (doc_id,))
+        
+        res = cursor.fetchone()
+        conn.close()
+
+        if not res or not os.path.exists(res[1]):
+            raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor.")
+
+        nome_arquivo = res[0]
+        caminho_arquivo = res[1]
+        extensao = os.path.splitext(nome_arquivo)[1].lower()
+
+        # Dicionário de MIME types
+        mime_types = {
+            '.pdf': 'application/pdf',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.doc': 'application/msword',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            '.xls': 'application/vnd.ms-excel',
+            '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            '.txt': 'text/plain',
+        }
+
+        media_type = mime_types.get(extensao, 'application/octet-stream')
+        
+        # PDF abre no navegador, outros fazem download
+        if extensao == '.pdf':
+            disposition = "inline"
+        else:
+            disposition = "attachment"
+
+        return FileResponse(
+            path=caminho_arquivo,
+            media_type=media_type,
+            headers={"Content-Disposition": f"{disposition}; filename={nome_arquivo}"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"erro": str(e)}
+
+@app.delete("/peticoes/{id}")
 async def deletar(id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT nome_peticao, caminho_despacho FROM peticoes WHERE id = ?", (id,))
+    cursor.execute("SELECT nome_peticao, caminho_peticao, caminho_despacho FROM peticoes WHERE id = ?", (id,))
     res = cursor.fetchone()
     
     if res:
         # Apaga os arquivos físicos para não entulhar o servidor
-        p_peticao = os.path.join(UPLOAD_DIR, "peticoes", res[0])
-        if os.path.exists(p_peticao): os.remove(p_peticao)
         if os.path.exists(res[1]): os.remove(res[1])
+        if os.path.exists(res[2]): os.remove(res[2])
         
         cursor.execute("DELETE FROM peticoes WHERE id = ?", (id,))
         conn.commit()
